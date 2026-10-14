@@ -1,0 +1,44 @@
+name: MoEBench
+options:
+  deploymentTarget:
+    iOS: "18.0"
+configFiles:
+  Debug: Config/App.xcconfig
+  Release: Config/App.xcconfig
+settings:
+  base:
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+targets:
+  MoEBench:
+    type: application
+    platform: iOS
+    sources: [MoEBench]
+    dependencies:
+      - framework: ../third_party/llama.cpp/build-apple/llama.xcframework
+        embed: true
+      - sdk: Metal.framework
+      - sdk: Accelerate.framework
+    entitlements:
+      path: MoEBench/MoEBench.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.developer.kernel.extended-virtual-addressing: true
+    info:
+      path: MoEBench/Info.plist
+      properties:
+        CFBundleDisplayName: MoEBench
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_OBJC_BRIDGING_HEADER: MoEBench/MoEBench-Bridging.h
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../third_party/llama.cpp/include
+          - $(SRCROOT)/../third_party/llama.cpp/ggml/include
+          - $(SRCROOT)/../third_party/llama.cpp/common
+          - $(SRCROOT)/../third_party/llama.cpp/vendor

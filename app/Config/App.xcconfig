@@ -1,0 +1,6 @@
+// Signing for your own device. Copy Local.xcconfig.example to Local.xcconfig and fill it in;
+// Local.xcconfig is ignored by git.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.moebench
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"

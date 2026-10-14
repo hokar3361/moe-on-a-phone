@@ -1,0 +1,911 @@
+diff --git a/build-xcframework.sh b/build-xcframework.sh
+index e2a2684..c47947c 100755
+--- a/build-xcframework.sh
++++ b/build-xcframework.sh
+@@ -11,7 +11,7 @@ TVOS_MIN_OS_VERSION=16.4
+ 
+ BUILD_SHARED_LIBS=OFF
+ LLAMA_BUILD_APP=OFF
+-LLAMA_BUILD_COMMON=OFF
++LLAMA_BUILD_COMMON=${LLAMA_BUILD_COMMON:-OFF}
+ LLAMA_BUILD_EXAMPLES=OFF
+ LLAMA_BUILD_TOOLS=OFF
+ LLAMA_BUILD_TESTS=OFF
+@@ -299,6 +299,10 @@ combine_static_libraries() {
+         "${base_dir}/${build_dir}/ggml/src/ggml-blas/${release_dir}/libggml-blas.a"
+         "${base_dir}/${build_dir}/tools/mtmd/${release_dir}/libmtmd.a"
+         "${base_dir}/${build_dir}/vendor/hash/${release_dir}/libvendor-hash.a"
++        $( [[ "${LLAMA_BUILD_COMMON}" == "ON" ]] && echo \
++            "${base_dir}/${build_dir}/common/${release_dir}/libllama-common.a" \
++            "${base_dir}/${build_dir}/common/${release_dir}/libllama-common-base.a" \
++            "${base_dir}/${build_dir}/vendor/cpp-httplib/${release_dir}/libcpp-httplib.a" )
+     )
+ 
+     # Create temporary directory for processing
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e906466..65c99a9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -251,10 +251,27 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
+     return ctx->name;
+ }
+ 
++// Wait for a command buffer by polling its status instead of blocking (from moe-on-a-desk 0007).
++// An idle CPU lets the SoC drop its fabric/memory clocks; a polling core keeps them up.
++// Off by default here (it costs power on a phone); GGML_METAL_SPIN_WAIT=1 turns it on.
++static void ggml_metal_wait_cmd_buf(id<MTLCommandBuffer> cmd_buf) {
++    static int spin = -1;
++    if (spin < 0) {
++        const char * env = getenv("GGML_METAL_SPIN_WAIT");
++        spin = env != NULL && atoi(env) != 0;
++    }
++    if (spin) {
++        while ([cmd_buf status] < MTLCommandBufferStatusCompleted) {
++            // busy poll
++        }
++    }
++    [cmd_buf waitUntilCompleted];
++}
++
+ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     // wait for any backend operations to finish
+     if (ctx->cmd_buf_last) {
+-        [ctx->cmd_buf_last waitUntilCompleted];
++        ggml_metal_wait_cmd_buf(ctx->cmd_buf_last);
+         ctx->cmd_buf_last = nil;
+     }
+ 
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97250c2..1757186 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -29,6 +29,7 @@ set(LLAMA_CORE_SOURCES
+     llama-kv-cache-dsv4.cpp
+     llama-memory.cpp
+     llama-moe-cache.cpp
++    llama-moe-prefetch.cpp
+     llama-memory-hybrid.cpp
+     llama-memory-hybrid-iswa.cpp
+     llama-memory-hybrid-idx.cpp
+@@ -76,3 +77,7 @@ if (BUILD_SHARED_LIBS)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+ endif()
++
++if (APPLE)
++    target_link_libraries(llama PRIVATE "-framework Accelerate")
++endif()
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..c94541a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -10,6 +10,7 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
++#include "llama-moe-prefetch.h"
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
+@@ -227,6 +228,14 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
++    if (cparams.cb_eval == nullptr) {
++        moe_prefetch = llama_moe_prefetch::create(model);
++        if (moe_prefetch) {
++            cparams.cb_eval           = llama_moe_prefetch::eval_cb;
++            cparams.cb_eval_user_data = moe_prefetch.get();
++        }
++    }
++
+     cparams.ctx_other = nullptr;
+ 
+     // TODO: more generic
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..82b5633 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -19,6 +19,7 @@
+ struct llama_model;
+ class llama_batch_allocr;
+ class llama_moe_cache;
++class llama_moe_prefetch;
+ 
+ class llama_io_read_i;
+ class llama_io_write_i;
+@@ -308,6 +309,7 @@ private:
+ 
+     llama_memory_ptr memory;
+     llama_moe_cache_ptr moe_cache;
++    std::unique_ptr<llama_moe_prefetch> moe_prefetch;
+ 
+     // decode output (2-dimensional array: [n_outputs][n_vocab])
+     buffer_view<float> logits = {nullptr, 0};
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index aeab7b7..bd41e84 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,5 +1,9 @@
+ #include "llama-model.h"
+ 
++#if defined(__unix__) || defined(__APPLE__)
++#include <unistd.h>
++#endif
++
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+ #include "llama-hparams.h"
+@@ -1331,6 +1335,13 @@ llama_model::~llama_model() {
+     for (auto * lora : loras) {
+         delete lora;
+     }
++#if defined(__unix__) || defined(__APPLE__)
++    for (int fd : expert_fds) {
++        if (fd >= 0) {
++            close(fd);
++        }
++    }
++#endif
+ }
+ 
+ void llama_model_base::load_stats(llama_model_loader & ml) {
+@@ -2019,6 +2030,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++#if defined(__unix__) || defined(__APPLE__)
++    // remember where the expert weights are in the files, so they can be read directly instead of through the mapping
++    for (const auto & file : ml.files) {
++        expert_fds.push_back(dup(file->file_id()));
++    }
++    for (const auto & layer : layers) {
++        for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++            if (t == nullptr) {
++                continue;
++            }
++            const auto * w = ml.get_weight(ggml_get_name(t));
++            if (w != nullptr && w->idx < expert_fds.size() && expert_fds[w->idx] >= 0) {
++                expert_files[t] = { expert_fds[w->idx], w->offs };
++            }
++        }
++    }
++#endif
++
+     load_tensors_hadamard();
+ 
+     return true;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index bc640e0..4de1700 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -831,6 +831,14 @@ struct llama_model {
+ 
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
++    // file location of the expert weights, to read them with pread (fds are dup'd and owned by the model)
++    struct weight_file_range {
++        int    fd;
++        size_t offs;
++    };
++    std::unordered_map<const ggml_tensor *, weight_file_range> expert_files;
++    std::vector<int> expert_fds;
++
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986..9bd2df5 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -6,10 +6,20 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <stdexcept>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
++#if defined(__APPLE__)
++#include <Accelerate/Accelerate.h>
++#include <dispatch/dispatch.h>
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
+ namespace {
+ 
+ // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
+@@ -210,6 +220,39 @@ struct llama_moe_cache::impl {
+     std::vector<int32_t> ids;
+     std::vector<moe_cache_lru::fill> fills;
+ 
++    // read the missing experts from the model files with F_NOCACHE pread, in parallel, straight into the banks
++    // (instead of copying them from the mapping, which faults the pages in one at a time and keeps them in the page cache)
++    const llama_model & model;
++    bool direct_read = false;
++    struct read_chunk {
++        int      fd;
++        size_t   offs;
++        uint8_t * dst;
++        size_t   size;
++    };
++    std::vector<read_chunk> chunks;
++    double t_fill_ms = 0.0;
++    double t_sync_ms = 0.0;
++
++    // read the predicted experts of the next layer while the current one computes (LLAMA_MOE_CACHE_PREDICT=k)
++    int n_predict = 0;
++#if defined(__APPLE__)
++    dispatch_queue_t q_pred = nullptr;
++    dispatch_group_t g_pred = nullptr;
++#endif
++    std::vector<read_chunk> chunks_pred;
++    std::vector<moe_cache_lru::fill> fills_pred;
++    int32_t pred_layer = -1;
++    std::vector<int32_t> pred;
++    std::vector<float> x;
++    std::vector<float> logits;
++    std::vector<int32_t> order;
++    size_t pred_sel = 0;
++    size_t pred_hit = 0;
++    size_t pred_bytes = 0;
++    double t_pred_wait_ms = 0.0;
++    double t_route_ms = 0.0;
++
+     // slot maps in host memory
+     ggml_context_ptr ctx_host;
+     ggml_backend_buffer_ptr buf_host;
+@@ -219,7 +262,7 @@ struct llama_moe_cache::impl {
+     ggml_context_ptr ctx_views;
+ 
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), model(model) {
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -427,6 +470,41 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++#if defined(__APPLE__)
++        if (const char * env = getenv("LLAMA_MOE_CACHE_PREAD"); env != nullptr && atoi(env) != 0 && !model.hparams.no_alloc) {
++            // the banks must be host-writable: CPU buffers or Metal shared buffers ("MTL0", not "MTL0_Private")
++            direct_read = true;
++            for (const group & g : groups) {
++                for (const ggml_tensor * bank : g.banks) {
++                    const std::string name = ggml_backend_buffer_name(bank->buffer);
++                    const bool shared = name.rfind("MTL", 0) == 0 && name.find('_') == std::string::npos;
++                    if (!ggml_backend_buffer_is_host(bank->buffer) && !shared) {
++                        direct_read = false;
++                    }
++                }
++                for (int32_t il : g.layers) {
++                    for (const ggml_tensor * t : layers[il].experts) {
++                        if (model.expert_files.find(t) == model.expert_files.end()) {
++                            direct_read = false;
++                        }
++                    }
++                }
++            }
++            if (direct_read) {
++                for (int fd : model.expert_fds) {
++                    fcntl(fd, F_NOCACHE, 1);
++                }
++            }
++            LLAMA_LOG_INFO("%s: direct reads of missing experts: %s\n", __func__, direct_read ? "on" : "off (unsupported buffers or files)");
++            if (const char * envp = getenv("LLAMA_MOE_CACHE_PREDICT"); direct_read && envp != nullptr && atoi(envp) > 0) {
++                n_predict = atoi(envp);
++                q_pred = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
++                g_pred = dispatch_group_create();
++                LLAMA_LOG_INFO("%s: predicting the top %d experts of the next layer\n", __func__, n_predict);
++            }
++        }
++#endif
++
+         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
+         for (device & d : devices) {
+             if (d.buf) {
+@@ -456,6 +534,11 @@ struct llama_moe_cache::impl {
+     }
+ 
+     ~impl() {
++#if defined(__APPLE__)
++        if (g_pred != nullptr) {
++            dispatch_group_wait(g_pred, DISPATCH_TIME_FOREVER);
++        }
++#endif
+         log_stats();
+     }
+ 
+@@ -512,6 +595,89 @@ struct llama_moe_cache::impl {
+         return n;
+     }
+ 
++#if defined(__APPLE__)
++    // apply the router of layer il + 1 to the router input of layer il, give slots to its top experts and read them in the background
++    void predict_next(const ggml_tensor * sel, int32_t il) {
++        const int32_t il_next = il + 1;
++        if (il_next >= (int32_t) layers.size() || layers[il_next].ig < 0) {
++            return;
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++
++        const ggml_tensor * cur = sel;
++        for (int i = 0; i < 16 && cur != nullptr && cur->op != GGML_OP_MUL_MAT; ++i) {
++            cur = cur->view_src != nullptr ? cur->view_src : cur->src[0];
++        }
++        if (cur == nullptr || cur->op != GGML_OP_MUL_MAT) {
++            return;
++        }
++        cur = cur->src[1];
++        const ggml_tensor * r = model.layers[il_next].ffn_gate_inp;
++        const layer & ln = layers[il_next];
++        group & gn = groups[ln.ig];
++        const int64_t n_expert = gn.ref[0]->ne[2];
++        if (r == nullptr || cur->type != GGML_TYPE_F32 || r->type != GGML_TYPE_F32 || r->ne[0] != cur->ne[0] || r->ne[1] != n_expert) {
++            return;
++        }
++        const int64_t n_embd = cur->ne[0];
++        x.resize(n_embd);
++        ggml_backend_tensor_get(cur, x.data(), (cur->ne[1] - 1)*cur->nb[1], n_embd*sizeof(float));
++
++        // the router weights are mapped from the file, their data is host memory
++        logits.resize(n_expert);
++        cblas_sgemv(CblasRowMajor, CblasNoTrans, (int) n_expert, (int) n_embd, 1.0f, (const float *) r->data, (int) (r->nb[1]/sizeof(float)),
++            x.data(), 1, 0.0f, logits.data(), 1);
++        order.resize(n_expert);
++        for (int64_t e = 0; e < n_expert; ++e) {
++            order[e] = (int32_t) e;
++        }
++        const int k = std::min<int>(n_predict, (int) n_expert);
++        std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
++        pred.assign(order.begin(), order.begin() + k);
++
++        size_t n_hit = 0;
++        if (!gn.lru.plan(il_next, pred.data(), pred.size(), fills_pred, n_hit)) {
++            return;
++        }
++        pred_layer = il_next;
++        t_route_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++
++        chunks_pred.clear();
++        constexpr size_t max_chunk = 512*1024;
++        for (size_t ip = 0; ip < ln.experts.size(); ++ip) {
++            const ggml_tensor * w    = ln.experts[ip];
++            ggml_tensor       * bank = gn.banks[ip];
++            const size_t expert_size = w->nb[2];
++            const auto & wf = model.expert_files.at(w);
++            for (const auto & f : fills_pred) {
++                const size_t offs = wf.offs + f.expert*expert_size;
++                uint8_t *    dst  = (uint8_t *) bank->data + f.slot*expert_size;
++                for (size_t o = 0; o < expert_size; o += max_chunk) {
++                    chunks_pred.push_back({ wf.fd, offs + o, dst + o, std::min(max_chunk, expert_size - o) });
++                }
++                pred_bytes += expert_size;
++            }
++        }
++        if (chunks_pred.empty()) {
++            return;
++        }
++        dispatch_group_async_f(g_pred, q_pred, this, [](void * p) {
++            impl * self = (impl *) p;
++            dispatch_apply_f(self->chunks_pred.size(), self->q_pred, self->chunks_pred.data(), [](void * ctx, size_t i) {
++                const read_chunk & c = ((const read_chunk *) ctx)[i];
++                size_t done = 0;
++                while (done < c.size) {
++                    const ssize_t n = pread(c.fd, c.dst + done, c.size - done, (off_t) (c.offs + done));
++                    if (n <= 0) {
++                        GGML_ABORT("MoE cache: pread failed");
++                    }
++                    done += (size_t) n;
++                }
++            });
++        });
++    }
++#endif
++
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+         const auto it = layer_of.find(src);
+         if (it == layer_of.end()) {
+@@ -545,17 +711,74 @@ struct llama_moe_cache::impl {
+         }
+         GGML_ASSERT(ggml_is_contiguous(sel));
+ 
++        const auto t_sync0 = std::chrono::steady_clock::now();
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+         ggml_backend_synchronize(backend);
++        t_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sync0).count();
++
++#if defined(__APPLE__)
++        // the predicted experts of this layer must be in their slots before the plan counts them as hits
++        if (pred_layer >= 0) {
++            const auto t0 = std::chrono::steady_clock::now();
++            dispatch_group_wait(g_pred, DISPATCH_TIME_FOREVER);
++            t_pred_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++            if (pred_layer == il) {
++                for (int32_t e : ids) {
++                    pred_sel++;
++                    pred_hit += std::find(pred.begin(), pred.end(), e) != pred.end();
++                }
++            }
++            pred_layer = -1;
++        }
++#endif
+ 
+         size_t n_hit = 0;
+         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
+ 
++        const auto t_fill0 = std::chrono::steady_clock::now();
++
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+         size_t bytes = 0;
++#if defined(__APPLE__)
++        if (direct_read) {
++            constexpr size_t max_chunk = 512*1024;
++            chunks.clear();
++            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                const ggml_tensor * w    = l.experts[ip];
++                ggml_tensor       * bank = g.banks[ip];
++                const size_t expert_size = w->nb[2];
++                const auto & wf = model.expert_files.at(w);
++                for (size_t i = 0; i < fills.size();) {
++                    size_t n = 1;
++                    while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                        n++;
++                    }
++                    const size_t offs = wf.offs + fills[i].expert*expert_size;
++                    uint8_t *    dst  = (uint8_t *) bank->data + fills[i].slot*expert_size;
++                    const size_t size = n*expert_size;
++                    for (size_t o = 0; o < size; o += max_chunk) {
++                        chunks.push_back({ wf.fd, offs + o, dst + o, std::min(max_chunk, size - o) });
++                    }
++                    bytes += size;
++                    i += n;
++                }
++            }
++            dispatch_apply_f(chunks.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), chunks.data(), [](void * ctx, size_t i) {
++                const read_chunk & c = ((const read_chunk *) ctx)[i];
++                size_t done = 0;
++                while (done < c.size) {
++                    const ssize_t r = pread(c.fd, c.dst + done, c.size - done, (off_t) (c.offs + done));
++                    if (r <= 0) {
++                        GGML_ABORT("MoE cache: pread failed");
++                    }
++                    done += (size_t) r;
++                }
++            });
++        } else
++#endif
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+             const ggml_tensor * w    = l.experts[ip];
+             ggml_tensor       * bank = g.banks[ip];
+@@ -571,6 +794,14 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        t_fill_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_fill0).count();
++
++#if defined(__APPLE__)
++        if (n_predict > 0 && (int64_t) ids.size() == n_expert_used) {
++            predict_next(sel, il);
++        }
++#endif
++
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+         st.misses += fills.size();
+@@ -591,6 +822,11 @@ struct llama_moe_cache::impl {
+             LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
+                 name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+         };
++        LLAMA_LOG_INFO("llama_moe_cache: time in fills = %.1f ms, waiting for the device = %.1f ms (direct reads: %s)\n", t_fill_ms, t_sync_ms, direct_read ? "on" : "off");
++        if (n_predict > 0) {
++            LLAMA_LOG_INFO("llama_moe_cache: predict %d: hit %.1f%% (%zu/%zu), read %.1f MiB, route %.1f ms, wait %.1f ms\n",
++                n_predict, pred_sel ? 100.0*pred_hit/pred_sel : 0.0, pred_hit, pred_sel, pred_bytes/1048576.0, t_route_ms, t_pred_wait_ms);
++        }
+         log("ubatch <= 8", stats_small);
+         log("ubatch  > 8", stats_large);
+         if (stats_copy.hits > 0) {
+diff --git a/src/llama-moe-prefetch.cpp b/src/llama-moe-prefetch.cpp
+new file mode 100644
+index 0000000..6ed326c
+--- /dev/null
++++ b/src/llama-moe-prefetch.cpp
+@@ -0,0 +1,360 @@
++#include "llama-moe-prefetch.h"
++
++#include "llama-impl.h"
++#include "llama-model.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++#if defined(__APPLE__)
++#include <dispatch/dispatch.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/param.h>
++#include <unistd.h>
++#endif
++
++#if defined(__APPLE__)
++
++namespace {
++
++struct read_chunk {
++    int             fd;
++    size_t          offs;
++    const uint8_t * addr; // same bytes in the mapping
++    size_t          size;
++};
++
++constexpr size_t page_size = 16384;
++constexpr size_t max_chunk = 512*1024;
++
++// how the chunks are brought into the page cache
++static void read_chunks(int mode, const read_chunk * chunks, size_t n, dispatch_queue_t q) {
++    if (n == 0) {
++        return;
++    }
++    struct ctx_t { int mode; const read_chunk * chunks; } ctx = { mode, chunks };
++    dispatch_apply_f(n, q, &ctx, [](void * p, size_t i) {
++        const ctx_t & c = *(const ctx_t *) p;
++        const read_chunk & r = c.chunks[i];
++        switch (c.mode) {
++            case 1: {
++                thread_local std::vector<uint8_t> buf(max_chunk);
++                size_t done = 0;
++                while (done < r.size) {
++                    const ssize_t k = pread(r.fd, buf.data(), r.size - done, (off_t) (r.offs + done));
++                    if (k <= 0) {
++                        break;
++                    }
++                    done += (size_t) k;
++                }
++            } break;
++            case 2: {
++                const uintptr_t a0 = (uintptr_t) r.addr & ~(uintptr_t) (page_size - 1);
++                const uintptr_t a1 = (uintptr_t) r.addr + r.size;
++                madvise((void *) a0, a1 - a0, MADV_WILLNEED);
++            } break;
++            default: {
++                volatile uint8_t sink = 0;
++                for (size_t o = 0; o < r.size; o += page_size) {
++                    sink ^= r.addr[o];
++                }
++                (void) sink;
++            } break;
++        }
++    });
++}
++
++}
++
++struct llama_moe_prefetch::impl {
++    struct part {
++        const ggml_tensor * w;
++        int    fd;
++        size_t offs;
++        size_t nb2;
++    };
++
++    const llama_model & model;
++    int mode;
++    int n_predict;
++    int n_expert;
++
++    std::vector<std::vector<part>> layers; // [n_layer] host expert tensors
++    std::vector<int> fds;                  // own descriptors, the model's may have F_NOCACHE set
++
++    dispatch_queue_t q_sync;
++    dispatch_queue_t q_pred;
++    dispatch_group_t g_pred;
++
++    int pred_layer = -1;
++    std::vector<int32_t> pred;
++    std::vector<read_chunk> chunks_pred;
++
++    std::vector<int32_t> ids;
++    std::vector<int32_t> uniq;
++    std::vector<uint8_t> is_pred;
++    std::vector<read_chunk> chunks;
++    std::vector<float> x;
++    std::vector<float> row;
++    std::vector<float> logits;
++    std::vector<int32_t> order;
++
++    // stats
++    size_t n_calls = 0;
++    size_t n_sel = 0;        // selected experts in layers that had a prediction
++    size_t n_hit = 0;        // of those, predicted
++    size_t bytes_sync = 0;
++    size_t bytes_pred = 0;
++    double t_sync_ms = 0.0;
++    double t_wait_ms = 0.0;
++    double t_route_ms = 0.0;
++
++    impl(const llama_model & model, int mode, int n_predict) : model(model), mode(mode), n_predict(n_predict) {
++        n_expert = (int) model.hparams.n_expert;
++        q_sync = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
++        q_pred = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
++        g_pred = dispatch_group_create();
++
++        std::vector<int> fd_map(1024, -1);
++        auto own_fd = [&](int fd) {
++            if (fd < 0 || fd >= (int) fd_map.size()) {
++                return -1;
++            }
++            if (fd_map[fd] < 0) {
++                char path[MAXPATHLEN];
++                if (fcntl(fd, F_GETPATH, path) == 0) {
++                    fd_map[fd] = open(path, O_RDONLY);
++                    if (fd_map[fd] >= 0) {
++                        fds.push_back(fd_map[fd]);
++                    }
++                }
++            }
++            return fd_map[fd];
++        };
++
++        layers.resize(model.layers.size());
++        for (size_t il = 0; il < model.layers.size(); ++il) {
++            const auto & layer = model.layers[il];
++            std::vector<part> parts;
++            bool ok = true;
++            for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++                if (t == nullptr) {
++                    continue;
++                }
++                const auto it = model.expert_files.find(t);
++                if (it == model.expert_files.end() || t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
++                    ok = false;
++                    break;
++                }
++                parts.push_back({ t, own_fd(it->second.fd), it->second.offs, t->nb[2] });
++            }
++            if (ok && !parts.empty()) {
++                layers[il] = std::move(parts);
++            }
++        }
++        is_pred.assign(n_expert, 0);
++    }
++
++    ~impl() {
++        dispatch_group_wait(g_pred, DISPATCH_TIME_FOREVER);
++        for (int fd : fds) {
++            close(fd);
++        }
++        if (n_calls > 0) {
++            LLAMA_LOG_INFO("llama_moe_prefetch: mode %d, predict %d: %zu calls, sync %.1f ms (%.1f MiB), wait %.1f ms, route %.1f ms, predicted %.1f MiB, prediction hit %.1f%% (%zu/%zu)\n",
++                mode, n_predict, n_calls, t_sync_ms, bytes_sync/1048576.0, t_wait_ms, t_route_ms, bytes_pred/1048576.0,
++                n_sel ? 100.0*n_hit/n_sel : 0.0, n_hit, n_sel);
++        }
++    }
++
++    bool has_layer(int il) const {
++        return il >= 0 && il < (int) layers.size() && !layers[il].empty();
++    }
++
++    void add_chunks(std::vector<read_chunk> & out, int il, int32_t e, size_t & bytes) {
++        for (const part & p : layers[il]) {
++            const size_t offs = p.offs + (size_t) e*p.nb2;
++            const uint8_t * addr = (const uint8_t *) p.w->data + (size_t) e*p.nb2;
++            for (size_t o = 0; o < p.nb2; o += max_chunk) {
++                out.push_back({ p.fd, offs + o, addr + o, std::min(max_chunk, p.nb2 - o) });
++            }
++            bytes += p.nb2;
++        }
++    }
++
++    // the router input: walk from the selected experts back to the router matmul
++    static ggml_tensor * router_input(ggml_tensor * t) {
++        for (int i = 0; i < 16 && t != nullptr; ++i) {
++            if (t->op == GGML_OP_MUL_MAT) {
++                return t->src[1];
++            }
++            t = t->view_src != nullptr ? t->view_src : t->src[0];
++        }
++        return nullptr;
++    }
++
++    void predict(ggml_tensor * sel, int il_next) {
++        const auto t0 = std::chrono::steady_clock::now();
++
++        ggml_tensor * cur = router_input(sel);
++        const ggml_tensor * r = model.layers[il_next].ffn_gate_inp;
++        if (cur == nullptr || r == nullptr || cur->type != GGML_TYPE_F32 || r->ne[0] != cur->ne[0] || r->ne[1] != n_expert) {
++            return;
++        }
++        const int64_t n_embd = cur->ne[0];
++        x.resize(n_embd);
++        ggml_backend_tensor_get(cur, x.data(), (cur->ne[1] - 1)*cur->nb[1], n_embd*sizeof(float));
++
++        logits.resize(n_expert);
++        const bool host = r->buffer != nullptr && ggml_backend_buffer_is_host(r->buffer);
++        const auto * traits = ggml_get_type_traits(r->type);
++        row.resize(n_embd);
++        for (int e = 0; e < n_expert; ++e) {
++            const float * w;
++            if (host && r->type == GGML_TYPE_F32) {
++                w = (const float *) ((const uint8_t *) r->data + e*r->nb[1]);
++            } else if (host && traits->to_float != nullptr) {
++                traits->to_float((const uint8_t *) r->data + e*r->nb[1], row.data(), n_embd);
++                w = row.data();
++            } else {
++                return;
++            }
++            float s = 0.0f;
++            for (int64_t i = 0; i < n_embd; ++i) {
++                s += w[i]*x[i];
++            }
++            logits[e] = s;
++        }
++        order.resize(n_expert);
++        for (int e = 0; e < n_expert; ++e) {
++            order[e] = e;
++        }
++        const int k = std::min(n_predict, n_expert);
++        std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int a, int b) { return logits[a] > logits[b]; });
++        pred.assign(order.begin(), order.begin() + k);
++        pred_layer = il_next;
++
++        t_route_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++
++        chunks_pred.clear();
++        for (int32_t e : pred) {
++            add_chunks(chunks_pred, il_next, e, bytes_pred);
++        }
++        struct job_t { impl * self; };
++        dispatch_group_async_f(g_pred, q_pred, this, [](void * p) {
++            impl * self = (impl *) p;
++            read_chunks(self->mode, self->chunks_pred.data(), self->chunks_pred.size(), self->q_pred);
++        });
++    }
++
++    void on_selected(ggml_tensor * sel, int il) {
++        const int64_t n_used   = sel->ne[0];
++        const int64_t n_tokens = sel->ne[1];
++        if (n_tokens > 4) {
++            return; // prompt batches touch most experts anyway
++        }
++        n_calls++;
++
++        ids.resize(n_used*n_tokens);
++        ggml_backend_tensor_get(sel, ids.data(), 0, ids.size()*sizeof(int32_t));
++
++        // the reads predicted for this layer must finish before they are counted on
++        const bool had_pred = pred_layer == il;
++        if (pred_layer >= 0) {
++            const auto t0 = std::chrono::steady_clock::now();
++            dispatch_group_wait(g_pred, DISPATCH_TIME_FOREVER);
++            t_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        }
++        if (had_pred) {
++            for (int32_t e : pred) {
++                is_pred[e] = 1;
++            }
++        }
++
++        const auto t0 = std::chrono::steady_clock::now();
++        uniq.clear();
++        for (int32_t e : ids) {
++            if (e >= 0 && e < n_expert && std::find(uniq.begin(), uniq.end(), e) == uniq.end()) {
++                uniq.push_back(e);
++            }
++        }
++        chunks.clear();
++        for (int32_t e : uniq) {
++            if (had_pred) {
++                n_sel++;
++                if (is_pred[e]) {
++                    n_hit++;
++                    continue;
++                }
++            }
++            add_chunks(chunks, il, e, bytes_sync);
++        }
++        if (had_pred) {
++            for (int32_t e : pred) {
++                is_pred[e] = 0;
++            }
++        }
++        pred_layer = -1;
++        read_chunks(mode, chunks.data(), chunks.size(), q_sync);
++        t_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++
++        if (n_predict > 0 && n_tokens == 1 && has_layer(il + 1)) {
++            predict(sel, il + 1);
++        }
++    }
++};
++
++std::unique_ptr<llama_moe_prefetch> llama_moe_prefetch::create(const llama_model & model) {
++    const char * env = getenv("LLAMA_MOE_PREFETCH");
++    const int mode = env != nullptr ? atoi(env) : 0;
++    if (mode <= 0 || model.expert_files.empty() || model.hparams.n_expert == 0) {
++        return nullptr;
++    }
++    const char * env_pred = getenv("LLAMA_MOE_PREDICT");
++    const int n_predict = env_pred != nullptr ? atoi(env_pred) : 0;
++    auto p = std::make_unique<impl>(model, mode, n_predict);
++    int n_layers = 0;
++    for (size_t il = 0; il < p->layers.size(); ++il) {
++        n_layers += p->has_layer((int) il);
++    }
++    if (n_layers == 0) {
++        return nullptr;
++    }
++    LLAMA_LOG_INFO("%s: mode %d, predict %d, %d host MoE layers\n", __func__, mode, n_predict, n_layers);
++    return std::unique_ptr<llama_moe_prefetch>(new llama_moe_prefetch(std::move(p)));
++}
++
++bool llama_moe_prefetch::eval_cb(ggml_tensor * t, bool ask, void * user_data) {
++    auto * self = (llama_moe_prefetch *) user_data;
++    int il = -1;
++    if (strncmp(t->name, "ffn_moe_topk-", 13) != 0 || sscanf(t->name + 13, "%d", &il) != 1 || !self->pimpl->has_layer(il)) {
++        return !ask; // not interested, keep computing
++    }
++    if (ask) {
++        return true;
++    }
++    self->pimpl->on_selected(t, il);
++    return true;
++}
++
++#else
++
++struct llama_moe_prefetch::impl {};
++
++std::unique_ptr<llama_moe_prefetch> llama_moe_prefetch::create(const llama_model &) {
++    return nullptr;
++}
++
++bool llama_moe_prefetch::eval_cb(ggml_tensor *, bool ask, void *) {
++    return !ask;
++}
++
++#endif
++
++llama_moe_prefetch::llama_moe_prefetch(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
++llama_moe_prefetch::~llama_moe_prefetch() = default;
+diff --git a/src/llama-moe-prefetch.h b/src/llama-moe-prefetch.h
+new file mode 100644
+index 0000000..84864f9
+--- /dev/null
++++ b/src/llama-moe-prefetch.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "ggml-backend.h"
++
++#include <memory>
++
++struct llama_model;
++
++// warms the page cache with the experts of host-resident (mmap) MoE layers right after the router selects them,
++// and predicts the experts of the next layer to read them while the current layer computes
++// enabled with LLAMA_MOE_PREFETCH=1 (pread), 2 (madvise WILLNEED) or 3 (touch the mapped pages); LLAMA_MOE_PREDICT=k reads the top k of the next layer
++class llama_moe_prefetch {
++public:
++    static std::unique_ptr<llama_moe_prefetch> create(const llama_model & model);
++    ~llama_moe_prefetch();
++
++    static bool eval_cb(ggml_tensor * t, bool ask, void * user_data);
++
++    struct impl;
++private:
++    explicit llama_moe_prefetch(std::unique_ptr<impl> p);
++    std::unique_ptr<impl> pimpl;
++};

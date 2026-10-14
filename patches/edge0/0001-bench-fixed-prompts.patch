@@ -1,0 +1,34 @@
+diff --git a/ios/Edge0PhoneProbe/ContentView.swift b/ios/Edge0PhoneProbe/ContentView.swift
+index 4e33ad3..1a272a0 100644
+--- a/ios/Edge0PhoneProbe/ContentView.swift
++++ b/ios/Edge0PhoneProbe/ContentView.swift
+@@ -205,6 +205,9 @@ private final class ChatViewModel: ObservableObject {
+                     messages[index].detail = detail
+                 }
+                 print("[generation] \(detail)")
++                if CommandLine.arguments.contains(where: { $0.hasPrefix("--bench-prompt=") }) {
++                    print("--- output ---\n\(result.text)\n--- end ---")
++                }
+                 if CommandLine.arguments.contains("--bench-second"),
+                    CommandLine.arguments.contains("--bench-35b") {
+                     print("[bench] second turn")
+@@ -337,6 +340,19 @@ struct ContentView: View {
+                     } else if chat.phase == .ready {
+                         let long = CommandLine.arguments.contains("--bench-long")
+                         let sentence = "Streaming inference overlaps disk bandwidth with compute. Each mixture-of-experts layer activates only a few experts."
++                        // moe-on-a-phone: fixed prompts, greedy 400 tokens, no thinking
++                        let fixed: [String: String] = [
++                            "code": "Write a Python function that parses an ISO-8601 date string and returns the weekday name. Include error handling.",
++                            "story": "Write a short story about a lighthouse keeper who finds a message in a bottle.",
++                        ]
++                        let fixedKey = CommandLine.arguments
++                            .first { $0.hasPrefix("--bench-prompt=") }
++                            .map { String($0.dropFirst("--bench-prompt=".count)) }
++                        if let fixedKey, let text = fixed[fixedKey] {
++                            print("[bench] prompt=\(fixedKey)")
++                            chat.useSuggestion(text, maxTokens: 400)
++                            return
++                        }
+                         let prompt = smoke
+                             ? "Reply with this only: 35B is running"
+                             : (long

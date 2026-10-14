@@ -1,3 +1,4 @@
 *.gguf
 *.safetensors
 models/
+third_party/

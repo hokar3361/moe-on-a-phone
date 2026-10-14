@@ -1,6 +1,19 @@
 # moe-on-a-phone
 
 > [!CAUTION]
+> **現時点では、iPhone へのインストールを推奨しません。** 端末への負荷が高すぎます。
+> 検証中(2026-10-14)に、iPhone 17e が **カーネルパニックで再起動** しました。Qwen3.8-Flash-Next 125B を動かし、ストレージから毎秒 2 GB 以上の
+> ランダム読み出しを数分間続けていた最中で、パニックの理由はストレージ(APFS)の処理が 60 秒応答しなくなったことでした。
+> Qwen3.6-35B でも数十秒で高温(serious)になります。負荷を抑える改良と再検証が済むまでは、このリポジトリは研究の記録として読むだけにしてください。
+
+> [!CAUTION]
+> **We do not recommend installing this on an iPhone yet.** It puts too much load on the device.
+> During testing (2026-10-14) the iPhone 17e **rebooted with a kernel panic** while running Qwen3.8-Flash-Next 125B with several minutes of
+> random storage reads above 2 GB/s; the panic reason was the storage (APFS) stack not responding for 60 seconds.
+> Qwen3.6-35B also reaches the "serious" thermal state within tens of seconds. Until the load is reduced and re-tested, please treat this
+> repository as a research log only.
+
+> [!CAUTION]
 > **端末がかなり熱くなります。利用は自己責任でお願いします。**
 > 35B の MoE モデルを iPhone で連続して動かすと、数十秒で iOS の温度状態が「serious」(高温)に達します。長時間続けて動かさないでください。
 > 熱いと感じたら止めて冷ましてください。ケースを付けたままや、充電しながらの実行は避けてください。バッテリーを大きく消費し、ストレージからの読み出しも大量に発生します。
@@ -51,6 +64,9 @@ Mac Studio 向けの [moe-on-a-desk](https://github.com/hokar3361/moe-on-a-desk)
 | [Edge0](https://github.com/Edge0-AI/Edge0) の iOS アプリ(参考)| int4、1 語 4 エキスパート | 6.4 | 6.1 |
 | **このパッチ(上流キャッシュ 3 GB + 並列 F_NOCACHE pread)** | IQ2_XXS | **12.1〜12.7** | **7.7〜9.7** |
 
+Qwen3.8-Flash-Next 125B(UD-IQ1_S、72.5 GB)も、エキスパートを mmap せず pread だけで読む形にして 1.81 / 1.87 tok/s(コード / 文章)で動きました。
+ただし、その構成を変えて測っている最中に、上のカーネルパニックが起きました。手順はまだ載せていません(記録は [DESIGN.md](DESIGN.md) の §10〜§12)。
+
 - 文章の値が振れるのは温度のためです。生成の途中で fair から serious に上がり、速度が落ちます。
 - Edge0 は量子化も、1 語あたりのエキスパート数も違います。同じ端末・同じプロンプトで測った参考値で、順位付けではありません。
 - 温度を管理していない状態の同じ設定は、7 tok/s 前後でした。
@@ -69,7 +85,10 @@ Mac Studio 向けの [moe-on-a-desk](https://github.com/hokar3361/moe-on-a-desk)
 
 試して効かなかった案(MTP の下書き、GPU 完了のスピン待ち、次の層の予測による先読みなど)は [DESIGN.md](DESIGN.md) の §8 にあります。
 
-## 使い方
+## 使い方(開発者向け・現時点では非推奨)
+
+> [!WARNING]
+> 冒頭のとおり、今はインストールを推奨しません。以下は、リスクを理解したうえで検証する開発者向けの記録です。
 
 ### 必要なもの
 
@@ -120,8 +139,9 @@ xcrun devicectl device copy to --device <UDID> --domain-type appDataContainer --
 
 ## まだできないこと
 
-- **Qwen3.8-Flash-Next(125B、Q1 で 72.5 GB)**:iOS でアプリが mmap できるアドレス空間は合計約 48 GiB で、ファイル全体を mmap する llama.cpp の読み込みでは入りません。
-  エキスパートを mmap せず pread だけで読む形に作り変えている途中です。
+- **負荷を抑えること**:ストレージへの同時読み出しの数を絞る、発熱を減らす、などの改良と再検証が必要です。
+- **Qwen3.8-Flash-Next(125B、Q1 で 72.5 GB)**:iOS でアプリが mmap できるアドレス空間は合計約 48 GiB です。エキスパートを mmap しない形で 1.8 tok/s で動きましたが、
+  検証中にカーネルパニックが起きたため、手順は公開していません。
 
 ## ライセンス
 
@@ -164,6 +184,10 @@ thermal state is nominal or fair.
 Prose varies with temperature: the phone goes from fair to serious during the run and slows down. Edge0 uses a different quantization and
 fewer experts per token; it is a reference point on the same phone, not a ranking.
 
+Qwen3.8-Flash-Next 125B (UD-IQ1_S, 72.5 GB) also ran at 1.81 / 1.87 tok/s (code / prose) with its experts read by `pread` only,
+never mapped. The kernel panic above happened while testing variations of that setup, so its steps are not published yet
+(log: [DESIGN.md](DESIGN.md) §10–§12).
+
 Quality checks (light): on a Mac, the greedy output of the upstream MoE cache and of this patch is byte-identical for 120 tokens (only how
 experts are read changed, not the math). On the phone, the outputs read naturally; no perplexity evaluation was done.
 
@@ -174,7 +198,10 @@ reads missing experts straight from the file into the Metal shared bank with par
 (time spent filling the cache: 73.7 s → 9.1 s over the two prompts). Ideas that did not help on the phone (MTP drafting, spin-waiting on
 the GPU, next-layer prediction) are logged in [DESIGN.md](DESIGN.md) §8.
 
-### How to use
+### How to use (for developers; not recommended for now)
+
+> [!WARNING]
+> As stated at the top, installing is not recommended for now. The steps below are a record for developers who understand the risk.
 
 Requirements: an Apple silicon Mac with Xcode (27.0 tested), xcodegen and CMake (`brew install xcodegen cmake`); an iPhone with
 Developer Mode on; about 12 GB free on the phone; **an Apple Developer account**. The app is distributed as source only: you sign it yourself.
@@ -208,8 +235,9 @@ state and memory. **Stop and let the phone cool down when it reaches serious.**
 
 ### Not working yet
 
-- **Qwen3.8-Flash-Next (125B, 72.5 GB at Q1)**: an iOS app can map about 48 GiB of address space in total, and llama.cpp maps whole files.
-  We are reworking it to read the experts with `pread` only, without mapping them.
+- **Reducing the load**: limiting the number of concurrent storage reads, reducing heat, and re-testing.
+- **Qwen3.8-Flash-Next (125B, 72.5 GB at Q1)**: an iOS app can map about 48 GiB of address space in total. It ran at 1.8 tok/s with the experts
+  never mapped, but a kernel panic happened during testing, so its steps are not published.
 
 ### License
 

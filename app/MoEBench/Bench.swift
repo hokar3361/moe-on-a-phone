@@ -18,6 +18,12 @@ struct BenchConfig {
     var stopAtEOG = true
     var moeCacheMiB = 0       // upstream GPU-side LRU of CPU-resident experts (llama.cpp --moe-cache-mib)
     var pread = false         // our patch: fill the MoE cache with parallel F_NOCACHE pread (LLAMA_MOE_CACHE_PREAD)
+    var nUbatch = 512         // prompt micro-batch; small values keep every batch inside the MoE cache
+    var repack = true         // CPU repacked weight layouts (they read the data at load time)
+    var unmappedExperts = false // LLAMA_UNMAPPED_EXPERT_FILES: don't map expert-only files (needs --pread)
+    var timing = false        // GGML_METAL_TIMING: average GPU span / wall time per graph every 64 graphs
+    var bellSpin = false      // GGML_METAL_BELL_SPIN: the bell worker spins instead of using the event listener
+    var bell = false          // LLAMA_MOE_CACHE_BELL: MoE cache lookups wait for the CPU inside the command buffer
     var spin = false          // GGML_METAL_SPIN_WAIT: poll the GPU instead of blocking
     var mtp = -1              // >= 0: generate with llama.cpp common speculative decoding, N MTP draft tokens (0 = none)
     var cachePredict = 0      // our patch: read the top-k predicted experts of the next layer into the MoE cache
@@ -41,6 +47,12 @@ struct BenchConfig {
             case "--no-eog-stop": c.stopAtEOG = false
             case "--cpu-moe": c.cpuMoE = true
             case "--pread": c.pread = true
+            case "--ubatch": c.nUbatch = Int(next() ?? "") ?? c.nUbatch
+            case "--no-repack": c.repack = false
+            case "--unmapped-experts": c.unmappedExperts = true
+            case "--bell": c.bell = true
+            case "--bell-spin": c.bellSpin = true
+            case "--timing": c.timing = true
             case "--spin": c.spin = true
             case "--mtp": c.mtp = Int(next() ?? "") ?? 0
             case "--cache-predict": c.cachePredict = Int(next() ?? "") ?? 0
@@ -97,7 +109,11 @@ final class BenchRunner {
         log("mem before load: \(MemInfo.now().text)")
 
         setenv("GGML_METAL_SPIN_WAIT", cfg.spin ? "1" : "0", 1)
-        log("spin wait \(cfg.spin)")
+        setenv("LLAMA_MOE_CACHE_BELL", cfg.bell ? "1" : "0", 1)
+        setenv("GGML_METAL_TIMING", cfg.timing ? "1" : "0", 1)
+        setenv("GGML_METAL_BELL_SPIN", cfg.bellSpin ? "1" : "0", 1)
+        setenv("LLAMA_UNMAPPED_EXPERT_FILES", cfg.unmappedExperts ? "1" : "0", 1)
+        log("spin wait \(cfg.spin), bell \(cfg.bell), unmapped experts \(cfg.unmappedExperts), ubatch \(cfg.nUbatch)")
         if cfg.mtp >= 0 {
             runSpec(cfg, path: path)
             return
@@ -106,6 +122,7 @@ final class BenchRunner {
         var mp = llama_model_default_params()
         mp.n_gpu_layers = cfg.nGpuLayers
         mp.load_mode = cfg.loadMode
+        mp.use_extra_bufts = cfg.repack && !cfg.unmappedExperts
         let pattern = strdup("\\.ffn_(up|down|gate)_exps")
         defer { free(pattern) }
         var overrides = [
@@ -136,6 +153,7 @@ final class BenchRunner {
         var cp = llama_context_default_params()
         cp.n_ctx = UInt32(cfg.nCtx)
         cp.n_batch = 512
+        cp.n_ubatch = UInt32(min(512, cfg.nUbatch))
         let nThreads = Int32(max(1, min(6, ProcessInfo.processInfo.activeProcessorCount - 2)))
         cp.n_threads = nThreads
         cp.n_threads_batch = nThreads
@@ -207,7 +225,7 @@ final class BenchRunner {
                 "footprint_peak_gib": Double(mem.footprintPeak) / 1073741824.0,
                 "available_gib": Double(mem.available) / 1073741824.0,
                 "load_mode": String(cString: llama_load_mode_name(cfg.loadMode)),
-                "n_ctx": cfg.nCtx, "ngl": cfg.nGpuLayers, "n_threads": nThreads, "cpu_moe": cfg.cpuMoE, "cache_predict": cfg.cachePredict, "prefetch": cfg.prefetch, "predict": cfg.predict,
+                "n_ctx": cfg.nCtx, "ngl": cfg.nGpuLayers, "n_threads": nThreads, "cpu_moe": cfg.cpuMoE, "bell": cfg.bell, "unmapped_experts": cfg.unmappedExperts, "n_ubatch": cfg.nUbatch, "cache_predict": cfg.cachePredict, "prefetch": cfg.prefetch, "predict": cfg.predict,
                 "thermal_start": thermal0, "thermal_end": thermalName(), "moe_cache_mib": cfg.moeCacheMiB, "pread": cfg.pread,
                 "output": out,
             ]
@@ -247,7 +265,7 @@ final class BenchRunner {
                 "date": ISO8601DateFormatter().string(from: Date()), "model": cfg.model, "prompt": name,
                 "mode": "spec", "mtp": cfg.mtp, "n_gen": Int(r.n_gen), "t_gen_s": r.t_gen_s, "decode_tps": tps,
                 "n_drafted": Int(r.n_drafted), "n_accepted": Int(r.n_accepted), "moe_cache_mib": cfg.moeCacheMiB,
-                "pread": cfg.pread, "spin": cfg.spin, "thermal_start": thermal0, "thermal_end": thermalName(),
+                "pread": cfg.pread, "spin": cfg.spin, "unmapped_experts": cfg.unmappedExperts, "bell": cfg.bell, "n_ubatch": cfg.nUbatch, "thermal_start": thermal0, "thermal_end": thermalName(),
                 "footprint_gib": Double(mem.footprint) / 1073741824.0, "output": out,
             ])
         }

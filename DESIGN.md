@@ -112,3 +112,34 @@ Qwen3.6-35B-A3B UD-IQ2_XXS、思考なし greedy 400、decode tok/s。温度は�
 
 引数なしで起動すると、チャット画面になる(`app/MoEBench/Chat.swift`)。モデルを選び、Code / Story を押して Send。
 既定はキャッシュ 3000 MiB + 並列 pread。文字が流れ、decode tok/s・温度・メモリが出る。
+
+## 10. Flash-Next を iPhone で読み込むために(2026-10-14)
+
+- iOS でアプリが mmap できるアドレス空間は合計約 48 GiB(17e、`--vatest`:無名の予約 48 GiB まで、46.6 GiB のファイルの次の 21 GiB で失敗)[事実]。
+  元の Flash-Next UD-IQ1_S(3 分割、計 67.6 GiB)は llama.cpp がファイル全体を mmap するので `mmap failed: Cannot allocate memory`。
+- 対策:`tools/split_experts.py` で「密な重み + 行の表」(30.44 GiB)と「エキスパートだけ」(19.95 + 17.16 GiB)に分け直し、
+  loader に `LLAMA_UNMAPPED_EXPERT_FILES=1` を足して、エキスパートだけのファイルは mmap しない(仮の番地を与え、MoE キャッシュが pread で読む)。
+  mmap は 30.44 GiB に収まる。プロンプトも MoE キャッシュを通るよう ubatch を小さく(4〜8)する。CPU の repack は中身を読むので切る(`--no-repack`)。
+- Mac で元のファイル(普通の mmap)と分け直したファイル(エキスパートは pread だけ)の greedy 60 トークンが一致 [事実]。
+
+## 11. MoE ベル(moe-on-a-desk の 02-glm-ssd 0003 を移植、`LLAMA_MOE_CACHE_BELL=1`)
+
+- 上流のキャッシュは MoE 層ごとにグラフを分け、CPU で slot map を作ってから続きを実行する(1 語 42 分割)。
+  ベルでは slot map を GPU の共有メモリに置き、ルーティングの後に `MTLSharedEvent` で合図、CPU が読み込みと slot map の更新をして合図を返すまで GPU が待つ(1 語 2 分割)。
+- 元の実装は CPU 側が合図をスピンで待つ。iPhone ではスピンが逆効果だった(§8)ので、`MTLSharedEventListener` の通知で受ける形にした。
+- Mac(M5 Max)、Qwen3.6 IQ2_XXS、キャッシュ 3 GB + pread、コード 120 トークン:39.9 → **64.4 tok/s**、出力はベルなしと一致 [事実]。
+
+## 12. iPhone 17e での Flash-Next と MoE ベルの結果
+
+| モデル・構成(17e) | コード | 文章 | 温度 |
+| --- | ---: | ---: | --- |
+| Flash-Next 125B UD-IQ1_S、エキスパートは mmap しない + pread + ベル、キャッシュ 1.2 GB、ubatch 4 | **1.81** | **1.87** | nominal のまま |
+| Qwen3.6 IQ2_XXS、キャッシュ 3 GB + pread(ベルなし、再測定) | 12.21 | 9.61 | nominal → serious |
+| 同上 + ベル(通知で待つ)、3 回 | 4.99〜5.08 | 10.13〜11.41 | 文章は fair 止まり |
+| 同上 + ベル(スピンで待つ、`GGML_METAL_BELL_SPIN=1`) | 7.51 | 7.97 | |
+
+- Flash:1 語約 545 ms。読み込み約 188 ms(ヒット率 44%、1 語 434 MB、約 2.3 GB/s)。GPU に載るのは密な重み 3.37 GiB + キャッシュ。
+  残りの約 355 ms は GPU の計算(1 語 7,200〜7,700 ノード)。Mac(M5 Max)では同じ部分が約 36 ms。
+- ベル:1 語のグラフが 4,087 ノード・2 分割になり、組み立ては 5〜8 ms(スピンでは 1.7 ms)。文章は速く涼しいが、ミスの多いコードで GPU の時間が 1 語 200 ms に伸びる
+  (読み込みは 35 ms)。原因は未特定(GPU が待ちから再開するときのクロックか、CPU が書いた共有バッファの扱いと推定)。既定にはしない。
+- 計測:`GGML_METAL_TIMING=1` で 64 グラフごとに組み立て時間・GPU の時間・壁時計の平均を出す(moe-on-a-desk 0001 を移植)。

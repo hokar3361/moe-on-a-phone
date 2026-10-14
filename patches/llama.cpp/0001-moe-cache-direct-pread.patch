@@ -23,10 +23,40 @@ index e2a2684..c47947c 100755
  
      # Create temporary directory for processing
 diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
-index e906466..65c99a9 100644
+index e906466..62d16a9 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
-@@ -251,10 +251,27 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
+@@ -82,6 +82,14 @@ struct ggml_metal {
+     // error state - set when a command buffer fails during synchronize
+     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
+     bool has_error;
++
++    // optional per-graph timing (GGML_METAL_TIMING=1, from moe-on-a-desk): averages every 64 graphs
++    int    timing;
++    int    t_nodes;
++    double t_submit;
++    double t_encoded;
++    int    t_n;
++    double t_sum_encode, t_sum_span, t_sum_wall, t_sum_nodes;
+ };
+ 
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+@@ -146,6 +154,14 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+             res->debug_graph = val ? atoi(val) : 0;
+         }
+ 
++        {
++            const char * val = getenv("GGML_METAL_TIMING");
++            res->timing   = val ? atoi(val) : 0;
++            res->t_submit = 0.0;
++            res->t_n      = 0;
++            res->t_sum_encode = res->t_sum_span = res->t_sum_wall = res->t_sum_nodes = 0.0;
++        }
++
+         res->use_graph_optimize = true;
+ 
+         if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
+@@ -251,10 +267,27 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
      return ctx->name;
  }
  
@@ -55,6 +85,294 @@ index e906466..65c99a9 100644
          ctx->cmd_buf_last = nil;
      }
  
+@@ -280,6 +313,39 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+         }
+     }
+ 
++    if (ctx->timing && ctx->t_submit > 0.0) {
++        const double t_done = [[NSProcessInfo processInfo] systemUptime];
++        double g0 = 0.0, g1 = 0.0;
++        for (int cb_idx = 0; cb_idx <= ctx->n_cb; ++cb_idx) {
++            id<MTLCommandBuffer> cb = ctx->cmd_bufs[cb_idx].obj;
++            if (!cb) {
++                continue;
++            }
++            const double s0 = [cb GPUStartTime];
++            const double s1 = [cb GPUEndTime];
++            if (s0 <= 0.0 || s1 <= 0.0) {
++                continue;
++            }
++            if (g0 == 0.0 || s0 < g0) {
++                g0 = s0;
++            }
++            if (s1 > g1) {
++                g1 = s1;
++            }
++        }
++        ctx->t_sum_encode += ctx->t_encoded - ctx->t_submit;
++        ctx->t_sum_span   += g1 - g0;
++        ctx->t_sum_wall   += t_done - ctx->t_submit;
++        ctx->t_sum_nodes  += ctx->t_nodes;
++        if (++ctx->t_n == 64) {
++            fprintf(stderr, "metal-timing (avg of 64 graphs): nodes=%.0f encode=%.2f gpu_span=%.2f wall=%.2f ms\n",
++                    ctx->t_sum_nodes/64, 1e3*ctx->t_sum_encode/64, 1e3*ctx->t_sum_span/64, 1e3*ctx->t_sum_wall/64);
++            ctx->t_n = 0;
++            ctx->t_sum_encode = ctx->t_sum_span = ctx->t_sum_wall = ctx->t_sum_nodes = 0.0;
++        }
++        ctx->t_submit = 0.0;
++    }
++
+     // release any completed extra command buffers
+     if (ctx->cmd_bufs_ext.count > 0) {
+         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+@@ -481,6 +547,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         return GGML_STATUS_SUCCESS;
+     }
+ 
++    // MoE bell: queue the CPU work of each MoE cache lookup whose slot map lives in device (shared) memory;
++    // the lookup node then waits for it inside its command buffer instead of the graph being split there
++    if (ggml_metal_moe_bell_enabled()) {
++        for (int i = 0; i < gf->n_nodes; ++i) {
++            struct ggml_tensor * node = gf->nodes[i];
++            if (node->op == GGML_OP_GET_ROWS && strncmp(node->name, "ffn_moe_slots-", 14) == 0 && node->src[1]->type == GGML_TYPE_I32 &&
++                    node->src[0]->buffer && !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
++                const uint64_t v1 = ggml_metal_moe_bell_post(atoi(node->name + 14), (const int32_t *) node->src[1]->data, ggml_nelements(node->src[1]));
++                node->op_params[13] = 0x6d6f6562;
++                node->op_params[14] = (int32_t) (uint32_t) v1;
++                node->op_params[15] = (int32_t) (uint32_t) (v1 >> 32);
++            }
++        }
++    }
++
+     // number of nodes encoded by the main thread (empirically determined)
+     const int n_main = MAX(64, 0.1*gf->n_nodes);
+ 
+@@ -500,6 +581,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+     @autoreleasepool {
+         ctx->gf = gf;
+ 
++        if (ctx->timing) {
++            ctx->t_submit = [[NSProcessInfo processInfo] systemUptime];
++            ctx->t_nodes  = gf->n_nodes;
++        }
++
+         if (ctx->n_cb == 0) {
+             // single-threaded encoding: the whole graph is encoded by one command buffer
+             ctx->n_nodes_0      = gf->n_nodes;
+@@ -594,6 +680,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ 
+         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+ 
++        if (ctx->timing) {
++            ctx->t_encoded = [[NSProcessInfo processInfo] systemUptime];
++        }
++
+         // for debugging: block until graph is computed
+         //[ctx->cmd_buf_last waitUntilCompleted];
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4012b9d..1f0abe6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -91,6 +91,14 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
+ 
+ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+ 
++// MoE bell: CPU work between two GPU stages inside one command buffer (MTLSharedEvent signal/wait, from moe-on-a-desk)
++// the CPU side runs from an MTLSharedEventListener notification instead of a spinning thread
++typedef void (*ggml_metal_moe_bell_fn)(void * ud, int il, const int32_t * ids, int64_t n_ids);
++void     ggml_metal_moe_bell_set(ggml_metal_moe_bell_fn fn, void * ud);
++bool     ggml_metal_moe_bell_enabled(void);
++uint64_t ggml_metal_moe_bell_post(int il, const int32_t * ids, int64_t n_ids); // the GPU signals v1 and waits for v1 + 1
++void     ggml_metal_moe_bell_encode(ggml_metal_cmd_buf_t cmd_buf, uint64_t v1);
++
+ //
+ // MTLLibrary wrapper
+ //
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 13aecbd..1647733 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -898,6 +898,115 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+     [encoder->obj endEncoding];
+ }
+ 
++static struct {
++    id<MTLSharedEvent>        ev;
++    MTLSharedEventListener *  listener;
++    ggml_metal_moe_bell_fn    fn;
++    void *                    ud;
++    uint64_t                  seq;
++} g_bell;
++
++void ggml_metal_moe_bell_set(ggml_metal_moe_bell_fn fn, void * ud) {
++    if (fn && !g_bell.ev) {
++        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
++        g_bell.ev = [dev newSharedEvent];
++        g_bell.ev.signaledValue = 0;
++        dispatch_queue_t q = dispatch_queue_create("ggml.metal.moe_bell", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
++        g_bell.listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:q];
++        g_bell.seq = 0;
++    }
++    g_bell.fn = fn;
++    g_bell.ud = ud;
++}
++
++bool ggml_metal_moe_bell_enabled(void) {
++    return g_bell.fn != NULL;
++}
++
++// GGML_METAL_BELL_SPIN=1: a worker thread spins on the event (as in moe-on-a-desk) instead of the listener
++#include <pthread.h>
++#define GGML_METAL_BELL_RING 8192
++static struct {
++    int  mode; // -1 unknown, 0 listener, 1 spin
++    pthread_mutex_t mtx;
++    pthread_cond_t  cv;
++    bool started;
++    struct { uint64_t v1; int il; const int32_t * ids; int64_t n; } ring[GGML_METAL_BELL_RING];
++    uint64_t head, tail;
++} g_spin = { .mode = -1, .mtx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
++
++static void * ggml_metal_moe_bell_spin_worker(void * arg) {
++    (void) arg;
++    for (;;) {
++        pthread_mutex_lock(&g_spin.mtx);
++        while (g_spin.head == g_spin.tail) {
++            pthread_cond_wait(&g_spin.cv, &g_spin.mtx);
++        }
++        const uint64_t h = g_spin.head % GGML_METAL_BELL_RING;
++        const uint64_t v1 = g_spin.ring[h].v1;
++        const int il = g_spin.ring[h].il;
++        const int32_t * ids = g_spin.ring[h].ids;
++        const int64_t n = g_spin.ring[h].n;
++        pthread_mutex_unlock(&g_spin.mtx);
++
++        while (g_bell.ev.signaledValue < v1) {
++            // the GPU has not computed the routing of this lookup yet
++        }
++        if (g_bell.fn) {
++            g_bell.fn(g_bell.ud, il, ids, n);
++        }
++        g_bell.ev.signaledValue = v1 + 1;
++
++        pthread_mutex_lock(&g_spin.mtx);
++        g_spin.head++;
++        pthread_mutex_unlock(&g_spin.mtx);
++    }
++    return NULL;
++}
++
++uint64_t ggml_metal_moe_bell_post(int il, const int32_t * ids, int64_t n_ids) {
++    const uint64_t v1 = g_bell.seq + 1;
++    g_bell.seq += 2;
++    if (g_spin.mode < 0) {
++        const char * env = getenv("GGML_METAL_BELL_SPIN");
++        g_spin.mode = env != NULL && atoi(env) != 0;
++    }
++    if (g_spin.mode == 1) {
++        pthread_mutex_lock(&g_spin.mtx);
++        if (!g_spin.started) {
++            pthread_t th;
++            pthread_create(&th, NULL, ggml_metal_moe_bell_spin_worker, NULL);
++            g_spin.started = true;
++        }
++        GGML_ASSERT(g_spin.tail - g_spin.head < GGML_METAL_BELL_RING);
++        const uint64_t t = g_spin.tail % GGML_METAL_BELL_RING;
++        g_spin.ring[t].v1  = v1;
++        g_spin.ring[t].il  = il;
++        g_spin.ring[t].ids = ids;
++        g_spin.ring[t].n   = n_ids;
++        g_spin.tail++;
++        pthread_cond_signal(&g_spin.cv);
++        pthread_mutex_unlock(&g_spin.mtx);
++        return v1;
++    }
++    ggml_metal_moe_bell_fn fn = g_bell.fn;
++    void * ud = g_bell.ud;
++    [g_bell.ev notifyListener:g_bell.listener atValue:v1 block:^(id<MTLSharedEvent> ev, uint64_t value) {
++        (void) value;
++        if (fn) {
++            fn(ud, il, ids, n_ids);
++        }
++        ev.signaledValue = v1 + 1;
++    }];
++    return v1;
++}
++
++void ggml_metal_moe_bell_encode(ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t v1) {
++    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++    [cmd_buf encodeSignalEvent:g_bell.ev value:v1];
++    [cmd_buf encodeWaitForEvent:g_bell.ev value:v1 + 1];
++}
++
+ struct ggml_metal_device {
+     id<MTLDevice> mtl_device;
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 115d736..31002a2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -44,6 +44,7 @@ struct ggml_metal_op {
+         int  debug_graph) {
+         this->dev             = dev;
+         this->lib             = ggml_metal_device_get_library(dev);
++        this->cmd_buf         = cmd_buf;
+         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
+         this->finfo           = finfo;
+@@ -103,6 +104,7 @@ struct ggml_metal_op {
+ 
+     ggml_metal_device_t  dev;
+     ggml_metal_library_t lib;
++    ggml_metal_cmd_buf_t cmd_buf;
+     ggml_metal_encoder_t enc;
+     ggml_mem_ranges_t    mem_ranges;
+ 
+@@ -1213,6 +1215,17 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
+ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
++    // MoE bell: the CPU fills the slot map between these two GPU stages (see ggml_metal_moe_bell_post)
++    const bool bell = op->op_params[13] == 0x6d6f6562;
++    if (bell) {
++        const uint64_t v1 = (uint64_t) (uint32_t) op->op_params[14] | ((uint64_t) (uint32_t) op->op_params[15] << 32);
++        ggml_metal_encoder_end_encoding(ctx->enc);
++        ggml_metal_encoder_free(ctx->enc);
++        ggml_metal_moe_bell_encode(ctx->cmd_buf, v1);
++        ctx->enc = ggml_metal_encoder_init(ctx->cmd_buf, ctx->use_concurrency);
++        ggml_metal_op_concurrency_reset(ctx);
++    }
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+@@ -1252,6 +1265,11 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, nw0*ne10, ne11, ne12, nth, 1, 1);
+ 
++    if (bell) {
++        // the ranges were reset with the new encoder: put a barrier after the gather for its readers
++        ggml_metal_op_concurrency_reset(ctx);
++    }
++
+     return 1;
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 344882e..24ba81d 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -943,6 +943,9 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
+ }
+ 
+ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_metal_set_moe_bell") == 0) {
++        return (void *) ggml_metal_moe_bell_set;
++    }
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_metal_get_features;
+     }
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 97250c2..1757186 100644
 --- a/src/CMakeLists.txt
@@ -122,6 +440,120 @@ index 6938fb1..82b5633 100644
  
      // decode output (2-dimensional array: [n_outputs][n_vocab])
      buffer_view<float> logits = {nullptr, 0};
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 80a7196..29d7ced 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -478,6 +478,13 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
+ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
++    bool unmapped = false;
++
++    impl(struct llama_file * file, uintptr_t fake_base) {
++        size     = file->size();
++        addr     = (void *) fake_base;
++        unmapped = true;
++    }
+ 
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         size = file->size();
+@@ -541,6 +548,9 @@ struct llama_mmap::impl {
+     }
+ 
+     void unmap_fragment(size_t first, size_t last) {
++        if (unmapped) {
++            return;
++        }
+         int page_size = sysconf(_SC_PAGESIZE);
+         align_range(&first, &last, page_size);
+         size_t len = last - first;
+@@ -586,6 +596,12 @@ struct llama_mmap::impl {
+ #elif defined(_WIN32)
+     HANDLE hMapping = nullptr;
+ 
++    impl(struct llama_file * file, uintptr_t fake_base) {
++        GGML_UNUSED(file);
++        GGML_UNUSED(fake_base);
++        throw std::runtime_error("unmapped files are not supported on this platform");
++    }
++
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         GGML_UNUSED(numa);
+ 
+@@ -655,6 +671,12 @@ struct llama_mmap::impl {
+         }
+     }
+ #else
++    impl(struct llama_file * file, uintptr_t fake_base) {
++        GGML_UNUSED(file);
++        GGML_UNUSED(fake_base);
++        throw std::runtime_error("mmap not supported");
++    }
++
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         GGML_UNUSED(file);
+         GGML_UNUSED(prefetch);
+@@ -678,6 +700,7 @@ struct llama_mmap::impl {
+ 
+ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+         const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
++llama_mmap::llama_mmap(struct llama_file * file, uintptr_t fake_base, unmapped_t) : pimpl(std::make_unique<impl>(file, fake_base)) {}
+ llama_mmap::~llama_mmap() = default;
+ 
+ size_t llama_mmap::size() const { return pimpl->size; }
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index 6c6393d..6b8dc0b 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -51,6 +51,11 @@ struct llama_mmap {
+     llama_mmap(const llama_mmap &) = delete;
+     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
+                const ranges & lazy_ranges = {});
++
++    // a placeholder that maps nothing: addr() is a fake base that must never be dereferenced
++    // (for files whose tensors are only read with pread, e.g. MoE experts behind the MoE cache)
++    struct unmapped_t {};
++    llama_mmap(struct llama_file * file, uintptr_t fake_base, unmapped_t);
+     ~llama_mmap();
+ 
+     size_t size() const;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index bc93c6f..b47a4bc 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1429,8 +1429,29 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
+ 
+             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+ 
+-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
+-                    lazy.for_file(idx));
++            // files that hold only MoE experts are not mapped when their experts are read with pread by the MoE cache
++            // (LLAMA_UNMAPPED_EXPERT_FILES=1): this keeps the mapped address space small, e.g. under the iOS limit
++            bool expert_only = false;
++            if (const char * env = getenv("LLAMA_UNMAPPED_EXPERT_FILES"); env != nullptr && atoi(env) != 0) {
++                expert_only = true;
++                bool any = false;
++                for (const auto & [name, w] : weights_map) {
++                    if (w.idx == idx) {
++                        any = true;
++                        if (name.find("_exps.") == std::string::npos) {
++                            expert_only = false;
++                            break;
++                        }
++                    }
++                }
++                expert_only = expert_only && any;
++            }
++            std::unique_ptr<llama_mmap> mapping = expert_only
++                ? std::make_unique<llama_mmap>(file.get(), (uintptr_t) 0x100000000000ull + (uintptr_t) idx*0x10000000000ull, llama_mmap::unmapped_t{})
++                : std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, lazy.for_file(idx));
++            if (expert_only) {
++                LLAMA_LOG_INFO("%s: file %u holds only experts, not mapped (%.2f GiB)\n", __func__, idx, file->size()/1073741824.0);
++            }
+             mmaps_used.emplace_back(mapping->size(), 0);
+             if (mlock_mmaps) {
+                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index aeab7b7..bd41e84 100644
 --- a/src/llama-model.cpp
@@ -195,7 +627,7 @@ index bc640e0..4de1700 100644
      float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
  
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index f22d986..9bd2df5 100644
+index f22d986..94156a2 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
 @@ -6,10 +6,20 @@
@@ -219,7 +651,15 @@ index f22d986..9bd2df5 100644
  namespace {
  
  // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
-@@ -210,6 +220,39 @@ struct llama_moe_cache::impl {
+@@ -178,6 +188,7 @@ struct llama_moe_cache::impl {
+     struct layer {
+         int32_t ig = -1;                    // -1 if the layer is not cached
+         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
++        ggml_tensor * slot_map_dev = nullptr; // bell mode: the slot map in device (shared) memory, read by the GPU lookup
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+     };
+ 
+@@ -210,6 +221,48 @@ struct llama_moe_cache::impl {
      std::vector<int32_t> ids;
      std::vector<moe_cache_lru::fill> fills;
  
@@ -256,19 +696,56 @@ index f22d986..9bd2df5 100644
 +    double t_pred_wait_ms = 0.0;
 +    double t_route_ms = 0.0;
 +
++    // bell mode (Metal, LLAMA_MOE_CACHE_BELL=1): the lookups wait for the CPU inside the command buffer instead of
++    // the graph being split at every MoE layer (from moe-on-a-desk, signalled with an event listener here)
++    bool bell = false;
++    void (*bell_set)(void (*)(void *, int, const int32_t *, int64_t), void *) = nullptr;
++    size_t n_bells = 0;
++    static void bell_cb(void * ud, int il, const int32_t * p, int64_t n) {
++        ((impl *) ud)->bell_fill(il, p, n);
++    }
++
      // slot maps in host memory
      ggml_context_ptr ctx_host;
      ggml_backend_buffer_ptr buf_host;
-@@ -219,7 +262,7 @@ struct llama_moe_cache::impl {
+@@ -219,7 +272,15 @@ struct llama_moe_cache::impl {
      ggml_context_ptr ctx_views;
  
      impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
 -            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
 +            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), model(model) {
++#if defined(__APPLE__)
++        if (const char * e1 = getenv("LLAMA_MOE_CACHE_BELL"), * e2 = getenv("LLAMA_MOE_CACHE_PREAD");
++                e1 && atoi(e1) != 0 && e2 && atoi(e2) != 0 && !model.hparams.no_alloc) {
++            ggml_backend_reg_t reg = ggml_backend_reg_by_name("MTL");
++            bell_set = reg ? (decltype(bell_set)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_moe_bell") : nullptr;
++            bell = bell_set != nullptr;
++        }
++#endif
          for (size_t i = 0; i < backends.size(); ++i) {
              const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
              if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-@@ -427,6 +470,41 @@ struct llama_moe_cache::impl {
+@@ -324,7 +385,7 @@ struct llama_moe_cache::impl {
+                 continue;
+             }
+             g.lru.init(model.layers.size(), n_expert, g.n_slots);
+-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
++            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (bell ? g.layers.size() : 0);
+             n_tensors_host  += g.layers.size();
+         }
+         if (n_tensors_host == 0) {
+@@ -377,6 +438,10 @@ struct llama_moe_cache::impl {
+                     bindings[l.experts[ip]] = { il, (int32_t) ip, cached };
+                 }
+                 l.slot_map = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
++                if (bell) {
++                    l.slot_map_dev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
++                    ggml_format_name(l.slot_map_dev, "moe_cache.slot_map_dev-%d", il);
++                }
+                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
+                 layer_of[l.slot_map] = il;
+                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+@@ -427,6 +492,55 @@ struct llama_moe_cache::impl {
              }
          }
  
@@ -298,6 +775,20 @@ index f22d986..9bd2df5 100644
 +                }
 +            }
 +            LLAMA_LOG_INFO("%s: direct reads of missing experts: %s\n", __func__, direct_read ? "on" : "off (unsupported buffers or files)");
++            if (bell && direct_read) {
++                for (group & g : groups) {
++                    for (int32_t il : g.layers) {
++                        if (layers[il].slot_map_dev != nullptr) {
++                            memset(layers[il].slot_map_dev->data, 0xff, ggml_nbytes(layers[il].slot_map_dev));
++                            g.lru.slot_map[il] = (int32_t *) layers[il].slot_map_dev->data;
++                        }
++                    }
++                }
++                bell_set(bell_cb, this);
++                LLAMA_LOG_INFO("%s: MoE bell on: lookups wait for the CPU inside the command buffer\n", __func__);
++            } else {
++                bell = false;
++            }
 +            if (const char * envp = getenv("LLAMA_MOE_CACHE_PREDICT"); direct_read && envp != nullptr && atoi(envp) > 0) {
 +                n_predict = atoi(envp);
 +                q_pred = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
@@ -310,11 +801,14 @@ index f22d986..9bd2df5 100644
          // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
          for (device & d : devices) {
              if (d.buf) {
-@@ -456,6 +534,11 @@ struct llama_moe_cache::impl {
+@@ -456,6 +570,14 @@ struct llama_moe_cache::impl {
      }
  
      ~impl() {
 +#if defined(__APPLE__)
++        if (bell) {
++            bell_set(nullptr, nullptr);
++        }
 +        if (g_pred != nullptr) {
 +            dispatch_group_wait(g_pred, DISPATCH_TIME_FOREVER);
 +        }
@@ -322,11 +816,81 @@ index f22d986..9bd2df5 100644
          log_stats();
      }
  
-@@ -512,6 +595,89 @@ struct llama_moe_cache::impl {
+@@ -469,7 +591,7 @@ struct llama_moe_cache::impl {
+         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+             return nullptr;
+         }
+-        return l.slot_map;
++        return bell ? l.slot_map_dev : l.slot_map;
+     }
+ 
+     ggml_tensor * get_experts(const ggml_tensor * w) const {
+@@ -512,6 +634,150 @@ struct llama_moe_cache::impl {
          return n;
      }
  
 +#if defined(__APPLE__)
++    // read the planned fills of a layer straight from the files into the banks, in parallel
++    size_t read_fills(const layer & l, group & g) {
++        constexpr size_t max_chunk = 512*1024;
++        size_t bytes = 0;
++        chunks.clear();
++        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++            const ggml_tensor * w    = l.experts[ip];
++            ggml_tensor       * bank = g.banks[ip];
++            const size_t expert_size = w->nb[2];
++            const auto & wf = model.expert_files.at(w);
++            for (size_t i = 0; i < fills.size();) {
++                size_t n = 1;
++                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
++                    n++;
++                }
++                const size_t offs = wf.offs + fills[i].expert*expert_size;
++                uint8_t *    dst  = (uint8_t *) bank->data + fills[i].slot*expert_size;
++                const size_t size = n*expert_size;
++                for (size_t o = 0; o < size; o += max_chunk) {
++                    chunks.push_back({ wf.fd, offs + o, dst + o, std::min(max_chunk, size - o) });
++                }
++                bytes += size;
++                i += n;
++            }
++        }
++        dispatch_apply_f(chunks.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), chunks.data(), [](void * ctx, size_t i) {
++            const read_chunk & c = ((const read_chunk *) ctx)[i];
++            size_t done = 0;
++            while (done < c.size) {
++                const ssize_t r = pread(c.fd, c.dst + done, c.size - done, (off_t) (c.offs + done));
++                if (r <= 0) {
++                    GGML_ABORT("MoE cache: pread failed");
++                }
++                done += (size_t) r;
++            }
++        });
++        return bytes;
++    }
++
++    // bell mode: runs between the routing and the lookup of layer il, while the GPU waits for it
++    void bell_fill(int32_t il, const int32_t * p, int64_t n) {
++        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
++            return;
++        }
++        const layer & l = layers[il];
++        group & g = groups[l.ig];
++        ids.assign(p, p + n);
++        size_t n_hit = 0;
++        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
++            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++        const size_t bytes = read_fills(l, g);
++        t_fill_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        n_bells++;
++        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
++        st.hits   += n_hit;
++        st.misses += fills.size();
++        st.bytes  += bytes;
++    }
++
 +    // apply the router of layer il + 1 to the router input of layer il, give slots to its top experts and read them in the background
 +    void predict_next(const ggml_tensor * sel, int32_t il) {
 +        const int32_t il_next = il + 1;
@@ -412,7 +976,7 @@ index f22d986..9bd2df5 100644
      bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
          const auto it = layer_of.find(src);
          if (it == layer_of.end()) {
-@@ -545,17 +711,74 @@ struct llama_moe_cache::impl {
+@@ -545,17 +811,41 @@ struct llama_moe_cache::impl {
          }
          GGML_ASSERT(ggml_is_contiguous(sel));
  
@@ -449,45 +1013,12 @@ index f22d986..9bd2df5 100644
          size_t bytes = 0;
 +#if defined(__APPLE__)
 +        if (direct_read) {
-+            constexpr size_t max_chunk = 512*1024;
-+            chunks.clear();
-+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-+                const ggml_tensor * w    = l.experts[ip];
-+                ggml_tensor       * bank = g.banks[ip];
-+                const size_t expert_size = w->nb[2];
-+                const auto & wf = model.expert_files.at(w);
-+                for (size_t i = 0; i < fills.size();) {
-+                    size_t n = 1;
-+                    while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
-+                        n++;
-+                    }
-+                    const size_t offs = wf.offs + fills[i].expert*expert_size;
-+                    uint8_t *    dst  = (uint8_t *) bank->data + fills[i].slot*expert_size;
-+                    const size_t size = n*expert_size;
-+                    for (size_t o = 0; o < size; o += max_chunk) {
-+                        chunks.push_back({ wf.fd, offs + o, dst + o, std::min(max_chunk, size - o) });
-+                    }
-+                    bytes += size;
-+                    i += n;
-+                }
-+            }
-+            dispatch_apply_f(chunks.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), chunks.data(), [](void * ctx, size_t i) {
-+                const read_chunk & c = ((const read_chunk *) ctx)[i];
-+                size_t done = 0;
-+                while (done < c.size) {
-+                    const ssize_t r = pread(c.fd, c.dst + done, c.size - done, (off_t) (c.offs + done));
-+                    if (r <= 0) {
-+                        GGML_ABORT("MoE cache: pread failed");
-+                    }
-+                    done += (size_t) r;
-+                }
-+            });
-+        } else
++            bytes = read_fills(l, g);        } else
 +#endif
          for (size_t ip = 0; ip < l.experts.size(); ++ip) {
              const ggml_tensor * w    = l.experts[ip];
              ggml_tensor       * bank = g.banks[ip];
-@@ -571,6 +794,14 @@ struct llama_moe_cache::impl {
+@@ -571,6 +861,14 @@ struct llama_moe_cache::impl {
              }
          }
  
@@ -502,11 +1033,11 @@ index f22d986..9bd2df5 100644
          stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
          st.hits   += n_hit;
          st.misses += fills.size();
-@@ -591,6 +822,11 @@ struct llama_moe_cache::impl {
+@@ -591,6 +889,11 @@ struct llama_moe_cache::impl {
              LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
                  name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
          };
-+        LLAMA_LOG_INFO("llama_moe_cache: time in fills = %.1f ms, waiting for the device = %.1f ms (direct reads: %s)\n", t_fill_ms, t_sync_ms, direct_read ? "on" : "off");
++        LLAMA_LOG_INFO("llama_moe_cache: time in fills = %.1f ms, waiting for the device = %.1f ms (direct reads: %s, bells: %zu)\n", t_fill_ms, t_sync_ms, direct_read ? "on" : "off", n_bells);
 +        if (n_predict > 0) {
 +            LLAMA_LOG_INFO("llama_moe_cache: predict %d: hit %.1f%% (%zu/%zu), read %.1f MiB, route %.1f ms, wait %.1f ms\n",
 +                n_predict, pred_sel ? 100.0*pred_hit/pred_sel : 0.0, pred_hit, pred_sel, pred_bytes/1048576.0, t_route_ms, t_pred_wait_ms);

@@ -11,4 +11,4 @@ xcrun devicectl device process launch --console --terminate-existing --device "$
 pid=$!
 until grep -qE "^DONE|^ERROR" "$log" 2>/dev/null || ! kill -0 $pid 2>/dev/null; do sleep 2; done
 sleep 2; kill $pid 2>/dev/null
-grep -E "^(\[|ERROR|thermal)|^mem: |block|llama_moe_cache: (time|ubatch <=|predict)|^spec:|^spin|llama_moe_prefetch: mode" "$log"
+grep -E "^(\[|ERROR|thermal)|^mem: |block|llama_moe_cache: (time|ubatch <=|predict)|^spec:|^spin|not mapped|MoE cache size|MoE bell on|MTL0_Mapped|mmap failed|error loading|metal-timing|llama_moe_prefetch: mode" "$log"

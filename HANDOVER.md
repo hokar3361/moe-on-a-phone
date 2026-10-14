@@ -45,3 +45,13 @@
    Qwen3.6-35B-A3B UD-IQ2_XXS を mmap で動かす(ファイルは Finder の「ファイル」共有でアプリの Documents へ)。動くか、何 tok/s か、メモリの上限で落ちないかを見る。
 2. 同じ端末で Edge0 の iOS エンジンを測る。
 3. 1 にエキスパートキャッシュ(上の 1〜4)を入れ、1 語あたりのストレージ読み出し量・ヒット率・tok/s を測る。
+
+## MacBook に置いた資材(2026-10-14)
+
+- `~/moe-on-a-phone`:このリポジトリ。
+- `~/moe-on-a-phone-work`(リポジトリには入れない作業用の資材):
+  - `patches/01-mac125b`(llama.cpp 781dbc5 の上の 52 本)、`patches/02-glm-ssd`(SSD 直読みのエキスパートキャッシュ・先読み・合図、5 本)、
+    `patches/03-prefetch-apple`(Apple 系の行の並列フォールト、1 本)。
+  - `llama.cpp`:上流を 781dbc5 から 3 系列すべて当てたブランチ `phone`(`apply.log`、全件きれいに当たった)。
+  - `models`:Qwen3.6-35B-A3B の UD-IQ2_XXS と UD-Q2_K_XL(`dl.sh` が sha256 を照合、`dl.log` に結果)。
+- この MacBook は M5 Max 128 GB・Xcode 入り。cmake と gh は入っていない(cmake は pip か Homebrew で入れる)。

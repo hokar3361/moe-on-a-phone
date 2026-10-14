@@ -2,6 +2,8 @@
 
 この作業を MacBook(Xcode と Apple Developer のアカウントがある端末)で続けるためのメモ。
 
+**最初に MacBook の `~/moe-on-a-phone-work/CONTEXT.md` を読むこと**(非公開の詳しい経緯:これまでの取り組みと失敗、進め方の観点、本命は Flash だがスペック見合いで軽量化が要ること、自分たちの仕組みと Strata のどちらが iPhone で良いかはまだ分からないこと)。元の記録一式は同じ場所の `context/`。
+
 ## 目的と端末
 
 - iPhone 16 Pro Max(メモリ 8 GB、ストレージ 256 GB)で MoE モデルを動かし、Mac Studio 向けに作った仕組みで速くする。

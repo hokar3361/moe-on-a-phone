@@ -1,5 +1,10 @@
 # moe-on-a-phone
 
+> **注意**:自己責任でお使いください(無保証)。スマートフォンで大きなモデルを動かすため、発熱・電池の消耗・ストレージの読み出しが大きくなります。
+> llama.cpp を土台にしていますが、改造による副作用は限られた機種でしか確かめていません。
+> *Use at your own risk (no warranty). Running large models on a phone means heat, battery drain and heavy storage reads; the
+> modifications to llama.cpp have been checked on very few devices.*
+
 iPhone(16 Pro Max、メモリ 8 GB)で MoE モデルを動かし、Mac Studio 向けに作った仕組み(SSD 直読みのエキスパートキャッシュ、
 ルーティングの先読み、MTP の深い下書きと停止規則、n-gram 表の並列読み)をスマートフォンに持ち込むプロジェクト。
 
